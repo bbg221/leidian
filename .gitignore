@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时
+*.log
+*.tmp
+
+# 可选：若不想把打包好的 exe 提交，取消下一行注释
+# dist/*.exe

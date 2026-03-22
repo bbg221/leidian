@@ -1,0 +1,2 @@
+# 打包 exe 时额外安装
+pyinstaller>=6.0

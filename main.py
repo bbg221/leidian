@@ -2,12 +2,16 @@
 雷电风格纵版射击 — 使用 pygame。
 共 50 关；逻辑分辨率 480×720，窗口按显示器自动缩放。敌机在 assets/Enemies，激光在 assets/Lasers。
 激光、僚机弹、呼叫支援（闪电风暴）等见代码常量。
+
+代码布局（便于维护）：
+- net_discovery.py : 纯 UDP/JSON 局域网发现协议，无 pygame，可被其他游戏复用。
+- lan_pairing.py   : 本游戏的「会话列表 + 配对」Pygame 界面，依赖 net_discovery。
+- main.py          : 资源、实体、单机主循环、联机主机/客户端同步与渲染。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import random
@@ -19,6 +23,16 @@ from enum import Enum, auto
 from pathlib import Path
 
 import pygame
+
+from lan_pairing import run_pairing_lobby
+from net_discovery import (
+    DEFAULT_DISCOVERY_PORT as LAN_DISCOVERY_PORT,
+    UDP_PACKET_MAX as LAN_PACKET_SIZE,
+    HostAdvertiser,
+    random_session_id,
+    udp_recv_all_json,
+    udp_send_json,
+)
 
 
 def _app_root() -> Path:
@@ -34,8 +48,7 @@ WIDTH, HEIGHT = 480, 720
 FPS = 60
 MAX_LEVEL = 50
 LAN_PORT = 28990
-LAN_DISCOVERY_PORT = 28991
-LAN_PACKET_SIZE = 65535
+# LAN_DISCOVERY_PORT / LAN_PACKET_SIZE 由 net_discovery 提供，便于其他项目复用同一发现层
 LAN_LOG_FILE = "lan_debug.log"
 
 # 相对 480×720 设计尺寸的线性比例，用于速度/精灵上限/部分 UI
@@ -893,14 +906,6 @@ class LanInput:
     respawn: bool = False
 
 
-def _safe_send_json(sock: socket.socket, addr: tuple[str, int], payload: dict[str, object]) -> None:
-    try:
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        sock.sendto(data, addr)
-    except OSError:
-        pass
-
-
 def lan_log(msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -910,181 +915,6 @@ def lan_log(msg: str) -> None:
             f.write(line + "\n")
     except OSError:
         pass
-
-
-def _poll_lan_messages(sock: socket.socket) -> list[tuple[dict[str, object], tuple[str, int]]]:
-    out: list[tuple[dict[str, object], tuple[str, int]]] = []
-    while True:
-        try:
-            raw, addr = sock.recvfrom(LAN_PACKET_SIZE)
-        except BlockingIOError:
-            break
-        except OSError:
-            break
-        try:
-            obj = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(obj, dict):
-            out.append((obj, addr))
-    return out
-
-
-def auto_pair_and_run(port: int = LAN_PORT, timeout_s: float = 120.0) -> None:
-    """
-    局域网自动发现并配对：
-    - 两台都启动 --lan auto
-    - 通过广播互相发现
-    - 用随机 id 决定角色（小 id=host，大 id=client）
-    """
-    pygame.init()
-    win_w, win_h = compute_window_size(WIDTH, HEIGHT)
-    screen = pygame.display.set_mode((win_w, win_h))
-    canvas = pygame.Surface((WIDTH, HEIGHT))
-    pygame.display.set_caption("雷电 · 自动配对中")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont("microsoftyahei", max(14, _vu(22)))
-    font_small = pygame.font.SysFont("microsoftyahei", max(12, _vu(18)))
-
-    my_id = random.randint(100_000, 999_999_999)
-    lan_log(f"[AUTO] start id={my_id} game_port={port} discovery_port={LAN_DISCOVERY_PORT} pid={os.getpid()}")
-    hello = {"type": "discover", "id": my_id, "port": port, "game": "leidian"}
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", LAN_DISCOVERY_PORT))
-    sock.setblocking(False)
-
-    start = time.time()
-    last_broadcast = 0.0
-    selected_peer: tuple[str, int] | None = None
-    selected_peer_id: int | None = None
-    selected_peer_type = "discover"
-    selected_peer_port = port
-    # id -> (ip, game_port, last_seen_ts, msg_type)
-    discovered: dict[int, tuple[str, int, float, str]] = {}
-    select_idx = 0
-    running = True
-
-    while running and time.time() - start < timeout_s:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_UP, pygame.K_w):
-                    select_idx -= 1
-                elif event.key in (pygame.K_DOWN, pygame.K_s):
-                    select_idx += 1
-                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    # 回车后按当前高亮会话连接
-                    alive_list = [
-                        (rid, ip, gp, seen, mtype)
-                        for rid, (ip, gp, seen, mtype) in discovered.items()
-                        if time.time() - seen <= 3.0
-                    ]
-                    alive_list.sort(key=lambda x: x[3], reverse=True)
-                    if alive_list:
-                        select_idx = max(0, min(select_idx, len(alive_list) - 1))
-                        rid, ip, gp, _, mtype = alive_list[select_idx]
-                        selected_peer = (ip, LAN_DISCOVERY_PORT)
-                        selected_peer_id = rid
-                        selected_peer_type = mtype
-                        selected_peer_port = gp
-                        lan_log(f"[AUTO] select peer rid={rid} type={mtype} ip={ip} gp={gp} my_id={my_id}")
-                        running = False
-
-        now = time.time()
-        if now - last_broadcast >= 0.5:
-            _safe_send_json(sock, ("255.255.255.255", LAN_DISCOVERY_PORT), hello)
-            lan_log(f"[AUTO] broadcast discover id={my_id} gp={port}")
-            last_broadcast = now
-
-        for msg, addr in _poll_lan_messages(sock):
-            mtype = str(msg.get("type", ""))
-            if mtype not in ("discover", "host_waiting"):
-                continue
-            if msg.get("game") != "leidian":
-                continue
-            try:
-                rid = int(msg.get("id", 0))
-                gp = int(msg.get("port", port))
-            except (TypeError, ValueError):
-                continue
-            if rid == my_id and mtype == "discover":
-                continue
-            if rid == 0:
-                # 手动 host 无 id，给一个稳定伪 id（按 ip）
-                rid = abs(hash(addr[0])) % 1_000_000_000 + 1_000_000_000
-            gp = max(1, min(65535, gp))
-            discovered[rid] = (addr[0], gp, time.time(), mtype)
-            lan_log(f"[AUTO] recv {mtype} from={addr[0]} rid={rid} gp={gp}")
-
-        alive_list = [
-            (rid, ip, gp, seen, mtype)
-            for rid, (ip, gp, seen, mtype) in discovered.items()
-            if time.time() - seen <= 3.0
-        ]
-        alive_list.sort(key=lambda x: x[3], reverse=True)
-        if alive_list:
-            select_idx = max(0, min(select_idx, len(alive_list) - 1))
-        else:
-            select_idx = 0
-
-        elapsed = time.time() - start
-        remain = max(0, int(timeout_s - elapsed))
-        canvas.fill((12, 16, 30))
-        title = font.render("局域网会话列表（自动发现中）", True, (220, 235, 255))
-        tip1 = font_small.render("另一台电脑运行: python main.py --lan auto", True, (185, 200, 220))
-        tip2 = font_small.render("上下键选择会话，回车连接；超时后自动主机等待", True, (255, 220, 140))
-        tip3 = font_small.render(f"倒计时: {remain}s  |  发现会话: {len(alive_list)}", True, (170, 180, 200))
-        canvas.blit(title, (_vu(20), _vu(44)))
-        canvas.blit(tip1, (_vu(20), _vu(78)))
-        canvas.blit(tip2, (_vu(20), _vu(104)))
-        canvas.blit(tip3, (_vu(20), _vu(130)))
-
-        list_top = _vu(176)
-        row_h = _vu(34)
-        max_rows = 10
-        if not alive_list:
-            empty = font_small.render("暂无可连接会话，正在继续搜索...", True, (200, 205, 220))
-            canvas.blit(empty, (_vu(26), list_top))
-        else:
-            for i, (rid, ip, gp, seen, mtype) in enumerate(alive_list[:max_rows]):
-                y = list_top + i * row_h
-                selected = i == select_idx
-                row_rect = pygame.Rect(_vu(20), y - _vu(4), WIDTH - _vu(40), row_h - _vu(2))
-                if selected:
-                    pygame.draw.rect(canvas, (42, 66, 110), row_rect, border_radius=6)
-                age_ms = int((time.time() - seen) * 1000)
-                role_hint = "可直连主机" if mtype == "host_waiting" else "自动竞选"
-                txt = f"[{i + 1}] {ip}:{gp}   id={rid}   {role_hint}   延迟≈{age_ms}ms"
-                color = (240, 245, 255) if selected else (205, 215, 235)
-                canvas.blit(font_small.render(txt, True, color), (_vu(28), y))
-
-        pygame.transform.smoothscale(canvas, (win_w, win_h), screen)
-        pygame.display.flip()
-        clock.tick(30)
-
-    sock.close()
-    pygame.quit()
-
-    if selected_peer is None or selected_peer_id is None:
-        if running:
-            # 未选中会话/超时：自动做主机，方便另一台稍后加入
-            lan_log("[AUTO] timeout/no selection -> host mode")
-            run_lan_host("0.0.0.0", port)
-        return
-
-    if selected_peer_type == "host_waiting":
-        lan_log(f"[AUTO] selected host_waiting -> force CLIENT target={selected_peer[0]}:{selected_peer_port}")
-        run_lan_client(selected_peer[0], selected_peer_port)
-    elif my_id < selected_peer_id:
-        lan_log(f"[AUTO] role=HOST my_id={my_id} peer_id={selected_peer_id}")
-        run_lan_host("0.0.0.0", port)
-    else:
-        lan_log(f"[AUTO] role=CLIENT my_id={my_id} peer_id={selected_peer_id} target={selected_peer[0]}:{selected_peer_port}")
-        run_lan_client(selected_peer[0], selected_peer_port)
 
 
 def run_lan_host(bind_ip: str, port: int) -> None:
@@ -1134,56 +964,34 @@ def run_lan_host(bind_ip: str, port: int) -> None:
     sock.bind((bind_ip, port))
     sock.setblocking(False)
     client_addr: tuple[str, int] | None = None
-    host_id = random.randint(100_000, 999_999_999)
-    discover_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    discover_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    discover_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        discover_sock.bind(("", LAN_DISCOVERY_PORT))
-    except OSError:
-        # 某些环境端口被占用时，至少保留广播能力
-        pass
-    discover_sock.setblocking(False)
-    last_wait_broadcast = 0.0
+    host_id = random_session_id()
+    # 发现层：等待客户端时广播并在收到 discover 时单播回复（见 net_discovery.HostAdvertiser）
+    advertiser = HostAdvertiser(
+        game_id="leidian",
+        host_id=host_id,
+        game_port=port,
+        discovery_port=LAN_DISCOVERY_PORT,
+        log=lan_log,
+    )
     lan_log(f"[HOST] start bind={bind_ip}:{port} host_id={host_id} pid={os.getpid()}")
 
     running = True
     while running:
         now = pygame.time.get_ticks()
-        now_sec = time.time()
-        if client_addr is None and now_sec - last_wait_broadcast >= 0.5:
-            _safe_send_json(
-                discover_sock,
-                ("255.255.255.255", LAN_DISCOVERY_PORT),
-                {"type": "host_waiting", "id": host_id, "port": port, "game": "leidian"},
-            )
-            lan_log(f"[HOST] broadcast host_waiting id={host_id} gp={port}")
-            last_wait_broadcast = now_sec
+        advertiser.tick(client_connected=client_addr is not None)
         if client_addr is None:
-            # 响应自动发现请求：B 机广播 discover 后，主机定向单播回复
-            for dmsg, daddr in _poll_lan_messages(discover_sock):
-                if dmsg.get("type") != "discover":
-                    continue
-                if dmsg.get("game") != "leidian":
-                    continue
-                lan_log(f"[HOST] recv discover from={daddr[0]}:{daddr[1]} -> reply host_waiting")
-                _safe_send_json(
-                    discover_sock,
-                    daddr,
-                    {"type": "host_waiting", "id": host_id, "port": port, "game": "leidian"},
-                )
+            advertiser.poll_and_reply_discover()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
-        for msg, addr in _poll_lan_messages(sock):
+        for msg, addr in udp_recv_all_json(sock):
             if msg.get("type") == "join":
                 client_addr = addr
                 lan_log(f"[HOST] recv join from={addr[0]}:{addr[1]} -> ack")
-                _safe_send_json(sock, addr, {"type": "ack"})
+                udp_send_json(sock, addr, {"type": "ack"})
             elif msg.get("type") == "input":
-                if client_addr is None:
-                    client_addr = addr
+                # 仅处理已握手(join)的客户端，避免误包把「等待中」误判为已连接并停止发现广播
                 if addr == client_addr:
                     remote_input.dx = int(clamp(float(msg.get("dx", 0)), -1, 1))
                     remote_input.dy = int(clamp(float(msg.get("dy", 0)), -1, 1))
@@ -1203,296 +1011,298 @@ def run_lan_host(bind_ip: str, port: int) -> None:
         )
         inputs = [local, remote_input]
         game_over = all(v <= 0 for v in lives)
+        need_kills = level_kills_to_boss(current_level)
 
-        for idx, p in enumerate(players):
-            if (not player_alive[idx]) and lives[idx] > 0 and inputs[idx].respawn:
-                player_alive[idx] = True
-                p.gun_mode = GunMode.SINGLE
-                p.wingmen = 0
-                p.power_mul = 1.0
-                p.support_left = 5
-                p.rect.midbottom = spawn_pos[idx]
+        # 未收到 join 前不跑双人模拟：否则 P2 固定在场上会被敌机撞光命，客户端晚进会「没命」
+        if client_addr is not None:
+            for idx, p in enumerate(players):
+                if (not player_alive[idx]) and lives[idx] > 0 and inputs[idx].respawn:
+                    player_alive[idx] = True
+                    p.gun_mode = GunMode.SINGLE
+                    p.wingmen = 0
+                    p.power_mul = 1.0
+                    p.support_left = 5
+                    p.rect.midbottom = spawn_pos[idx]
+                if game_over:
+                    continue
+                if phase not in (Phase.WAVE, Phase.BOSS, Phase.SETTLEMENT):
+                    continue
+                if not player_alive[idx]:
+                    continue
+                dx = float(inputs[idx].dx)
+                dy = float(inputs[idx].dy)
+                if dx != 0 and dy != 0:
+                    dx *= 0.707
+                    dy *= 0.707
+                p.rect.x += int(dx * PLAYER_SPEED)
+                p.rect.y += int(dy * PLAYER_SPEED)
+                p.rect.clamp_ip(canvas.get_rect())
+                if phase in (Phase.WAVE, Phase.BOSS) and inputs[idx].fire and now - last_fire[idx] >= BULLET_COOLDOWN_MS:
+                    spawn_player_bullets(
+                        bullets,
+                        assets,
+                        float(p.rect.centerx),
+                        float(p.rect.top),
+                        p.gun_mode,
+                        owner=idx,
+                        power_mul=p.power_mul,
+                    )
+                    if p.wingmen > 0:
+                        wing_fan_phase[idx] += _vf(0.55)
+                        for wi in range(p.wingmen):
+                            spawn_drone_pair(p.rect, assets, wing_fan_phase[idx] + wi * 0.45, drones, owner=idx)
+                    last_fire[idx] = now
+
+                if (
+                    phase in (Phase.WAVE, Phase.BOSS)
+                    and inputs[idx].support
+                    and now - last_support[idx] >= SUPPORT_COOLDOWN_MS
+                    and p.support_left > 0
+                ):
+                    p.support_left -= 1
+                    last_support[idx] = now
+                    lightning_until = now + LIGHTNING_FLASH_MS
+                    if phase == Phase.WAVE:
+                        for e in enemies:
+                            if not e.alive:
+                                continue
+                            e.alive = False
+                            push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
+                            score += e.base_score + (25 if e.is_special else 0)
+                            wave_kills += 1
+                            if e.is_special:
+                                pickups.append(
+                                    Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
+                                )
+                    elif phase == Phase.BOSS and boss and boss.alive:
+                        loss = max(1, boss.hp // 3)
+                        boss.hp -= loss
+                        if boss.hp <= 0:
+                            boss.alive = False
+                            push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
+                            score += 200 + current_level * 50
+
             if game_over:
-                continue
-            if phase not in (Phase.WAVE, Phase.BOSS, Phase.SETTLEMENT):
-                continue
-            if not player_alive[idx]:
-                continue
-            dx = float(inputs[idx].dx)
-            dy = float(inputs[idx].dy)
-            if dx != 0 and dy != 0:
-                dx *= 0.707
-                dy *= 0.707
-            p.rect.x += int(dx * PLAYER_SPEED)
-            p.rect.y += int(dy * PLAYER_SPEED)
-            p.rect.clamp_ip(canvas.get_rect())
-            if phase in (Phase.WAVE, Phase.BOSS) and inputs[idx].fire and now - last_fire[idx] >= BULLET_COOLDOWN_MS:
-                spawn_player_bullets(
-                    bullets,
-                    assets,
-                    float(p.rect.centerx),
-                    float(p.rect.top),
-                    p.gun_mode,
-                    owner=idx,
-                    power_mul=p.power_mul,
+                bullets.clear()
+                drones.clear()
+                enemies.clear()
+                pickups.clear()
+                boss_bullets.clear()
+            if (not game_over) and phase == Phase.WAVE:
+                wm_for_spawn = max(
+                    players[0].wingmen if player_alive[0] else 0,
+                    players[1].wingmen if player_alive[1] else 0,
                 )
-                if p.wingmen > 0:
-                    wing_fan_phase[idx] += _vf(0.55)
-                    for wi in range(p.wingmen):
-                        spawn_drone_pair(p.rect, assets, wing_fan_phase[idx] + wi * 0.45, drones, owner=idx)
-                last_fire[idx] = now
+                spawn_interval = spawn_interval_with_wingmen(current_level, score, wm_for_spawn)
+                if now - last_spawn >= spawn_interval and wave_kills < need_kills:
+                    active_arch = archetypes_for_level(assets.enemy_archetypes, current_level)
+                    pad = _vu(50)
+                    inner_lo, inner_hi = pad + _vu(24), WIDTH - pad - _vu(24)
+                    if inner_hi <= inner_lo:
+                        inner_lo, inner_hi = pad, WIDTH - pad
+                    for _ in range(enemies_per_spawn_with_wingmen(current_level, wm_for_spawn)):
+                        arch = pick_spawn_archetype(active_arch)
+                        enemies.append(
+                            Enemy(
+                                random.uniform(inner_lo, inner_hi),
+                                float(-_vu(20)),
+                                arch,
+                                special=(random.random() < SPECIAL_SPAWN_CHANCE),
+                                level=current_level,
+                            )
+                        )
+                    last_spawn = now
 
-            if (
-                phase in (Phase.WAVE, Phase.BOSS)
-                and inputs[idx].support
-                and now - last_support[idx] >= SUPPORT_COOLDOWN_MS
-                and p.support_left > 0
-            ):
-                p.support_left -= 1
-                last_support[idx] = now
-                lightning_until = now + LIGHTNING_FLASH_MS
+            if not game_over:
+                for b in bullets:
+                    b.update()
+                bullets = [b for b in bullets if bullet_on_screen(b)]
                 if phase == Phase.WAVE:
+                    homing_targets: list[object] = [e for e in enemies if e.alive]
+                else:
+                    homing_targets = [boss] if boss and boss.alive else []
+                for d in drones:
+                    d.update(homing_targets)
+                drones = [d for d in drones if d.alive and -40 < d.y < HEIGHT + 40 and -40 < d.x < WIDTH + 40]
+            if (not game_over) and phase == Phase.WAVE:
+                for e in enemies:
+                    e.update()
+                enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
+            if (not game_over) and phase == Phase.BOSS and boss:
+                boss.update(clock.get_time() / 1000.0)
+                if boss.alive and now - last_boss_shot >= boss_fire_interval(current_level):
+                    bx = boss.rect.centerx + random.randint(-12, 12)
+                    boss_bullets.append(
+                        EnemyBullet(
+                            bx,
+                            boss.rect.bottom + _vu(4),
+                            boss_bullet_skin,
+                            boss_bullet_speed(current_level),
+                        )
+                    )
+                    last_boss_shot = now
+                for bb in boss_bullets:
+                    bb.update()
+                boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
+            elif (not game_over) and phase == Phase.SETTLEMENT:
+                for bb in boss_bullets:
+                    bb.update()
+                boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
+
+            to_remove_b: set[int] = set()
+            if (not game_over) and phase == Phase.WAVE:
+                for bi, b in enumerate(bullets):
                     for e in enemies:
                         if not e.alive:
                             continue
-                        e.alive = False
-                        push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
-                        score += e.base_score + (25 if e.is_special else 0)
-                        wave_kills += 1
-                        if e.is_special:
-                            pickups.append(
-                                Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
-                            )
-                elif phase == Phase.BOSS and boss and boss.alive:
-                    loss = max(1, boss.hp // 3)
-                    boss.hp -= loss
-                    if boss.hp <= 0:
-                        boss.alive = False
-                        push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
-                        score += 200 + current_level * 50
-
-        need_kills = level_kills_to_boss(current_level)
-        if game_over:
-            bullets.clear()
-            drones.clear()
-            enemies.clear()
-            pickups.clear()
-            boss_bullets.clear()
-        if (not game_over) and phase == Phase.WAVE:
-            wm_for_spawn = max(
-                players[0].wingmen if player_alive[0] else 0,
-                players[1].wingmen if player_alive[1] else 0,
-            )
-            spawn_interval = spawn_interval_with_wingmen(current_level, score, wm_for_spawn)
-            if now - last_spawn >= spawn_interval and wave_kills < need_kills:
-                active_arch = archetypes_for_level(assets.enemy_archetypes, current_level)
-                pad = _vu(50)
-                inner_lo, inner_hi = pad + _vu(24), WIDTH - pad - _vu(24)
-                if inner_hi <= inner_lo:
-                    inner_lo, inner_hi = pad, WIDTH - pad
-                for _ in range(enemies_per_spawn_with_wingmen(current_level, wm_for_spawn)):
-                    arch = pick_spawn_archetype(active_arch)
-                    enemies.append(
-                        Enemy(
-                            random.uniform(inner_lo, inner_hi),
-                            float(-_vu(20)),
-                            arch,
-                            special=(random.random() < SPECIAL_SPAWN_CHANCE),
-                            level=current_level,
-                        )
-                    )
-                last_spawn = now
-
-        if not game_over:
-            for b in bullets:
-                b.update()
-            bullets = [b for b in bullets if bullet_on_screen(b)]
-            if phase == Phase.WAVE:
-                homing_targets: list[object] = [e for e in enemies if e.alive]
-            else:
-                homing_targets = [boss] if boss and boss.alive else []
-            for d in drones:
-                d.update(homing_targets)
-            drones = [d for d in drones if d.alive and -40 < d.y < HEIGHT + 40 and -40 < d.x < WIDTH + 40]
-        if (not game_over) and phase == Phase.WAVE:
-            for e in enemies:
-                e.update()
-            enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
-        if (not game_over) and phase == Phase.BOSS and boss:
-            boss.update(clock.get_time() / 1000.0)
-            if boss.alive and now - last_boss_shot >= boss_fire_interval(current_level):
-                bx = boss.rect.centerx + random.randint(-12, 12)
-                boss_bullets.append(
-                    EnemyBullet(
-                        bx,
-                        boss.rect.bottom + _vu(4),
-                        boss_bullet_skin,
-                        boss_bullet_speed(current_level),
-                    )
-                )
-                last_boss_shot = now
-            for bb in boss_bullets:
-                bb.update()
-            boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
-        elif (not game_over) and phase == Phase.SETTLEMENT:
-            for bb in boss_bullets:
-                bb.update()
-            boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
-
-        to_remove_b: set[int] = set()
-        if (not game_over) and phase == Phase.WAVE:
-            for bi, b in enumerate(bullets):
-                for e in enemies:
-                    if not e.alive:
+                        if b.rect.colliderect(e.rect):
+                            e.hp -= b.damage
+                            if e.hp <= 0:
+                                e.alive = False
+                                push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
+                                score += e.base_score + (25 if e.is_special else 0)
+                                wave_kills += 1
+                                if e.is_special:
+                                    pickups.append(
+                                        Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
+                                    )
+                            to_remove_b.add(bi)
+                            break
+                for d in drones:
+                    if not d.alive:
                         continue
-                    if b.rect.colliderect(e.rect):
-                        e.hp -= b.damage
-                        if e.hp <= 0:
-                            e.alive = False
-                            push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
-                            score += e.base_score + (25 if e.is_special else 0)
-                            wave_kills += 1
-                            if e.is_special:
-                                pickups.append(
-                                    Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
-                                )
+                    dr = d.hit_rect()
+                    for e in enemies:
+                        if not e.alive:
+                            continue
+                        if dr.colliderect(e.rect):
+                            e.hp -= d.damage
+                            if e.hp <= 0:
+                                e.alive = False
+                                push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
+                                score += e.base_score + (25 if e.is_special else 0)
+                                wave_kills += 1
+                                if e.is_special:
+                                    pickups.append(
+                                        Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
+                                    )
+                            d.alive = False
+                            break
+            elif (not game_over) and phase == Phase.BOSS and boss and boss.alive:
+                for bi, b in enumerate(bullets):
+                    if b.rect.colliderect(boss.rect):
+                        boss.hp -= b.damage
+                        if boss.hp <= 0:
+                            boss.alive = False
+                            push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
+                            score += 200 + current_level * 50
                         to_remove_b.add(bi)
-                        break
-            for d in drones:
-                if not d.alive:
-                    continue
-                dr = d.hit_rect()
+                for d in drones:
+                    if not d.alive:
+                        continue
+                    if d.hit_rect().colliderect(boss.rect):
+                        boss.hp -= d.damage
+                        d.alive = False
+                        if boss.hp <= 0:
+                            boss.alive = False
+                            push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
+                            score += 200 + current_level * 50
+            bullets = [b for i, b in enumerate(bullets) if i not in to_remove_b]
+            drones = [d for d in drones if d.alive and -40 < d.y < HEIGHT + 40 and -40 < d.x < WIDTH + 40]
+
+            explosions = [fx for fx in explosions if fx.alive(now)]
+
+            if (not game_over) and phase == Phase.WAVE:
                 for e in enemies:
                     if not e.alive:
                         continue
-                    if dr.colliderect(e.rect):
-                        e.hp -= d.damage
-                        if e.hp <= 0:
+                    for i, p in enumerate(players):
+                        if player_alive[i] and lives[i] > 0 and e.rect.colliderect(p.rect):
                             e.alive = False
                             push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
-                            score += e.base_score + (25 if e.is_special else 0)
-                            wave_kills += 1
-                            if e.is_special:
-                                pickups.append(
-                                    Pickup(float(e.rect.centerx), float(e.rect.centery), random_pickup_kind())
-                                )
-                        d.alive = False
-                        break
-        elif (not game_over) and phase == Phase.BOSS and boss and boss.alive:
-            for bi, b in enumerate(bullets):
-                if b.rect.colliderect(boss.rect):
-                    boss.hp -= b.damage
-                    if boss.hp <= 0:
-                        boss.alive = False
-                        push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
-                        score += 200 + current_level * 50
-                    to_remove_b.add(bi)
-            for d in drones:
-                if not d.alive:
-                    continue
-                if d.hit_rect().colliderect(boss.rect):
-                    boss.hp -= d.damage
-                    d.alive = False
-                    if boss.hp <= 0:
-                        boss.alive = False
-                        push_explosion(explosions, float(boss.rect.centerx), float(boss.rect.centery), now, big=True)
-                        score += 200 + current_level * 50
-        bullets = [b for i, b in enumerate(bullets) if i not in to_remove_b]
-        drones = [d for d in drones if d.alive and -40 < d.y < HEIGHT + 40 and -40 < d.x < WIDTH + 40]
+                            lives[i] -= 1
+                            player_alive[i] = False
+                            players[i].gun_mode = GunMode.SINGLE
+                            players[i].wingmen = 0
+                            players[i].power_mul = 1.0
+                            bullets = [bb for bb in bullets if bb.owner != i]
+                            drones = [dd for dd in drones if dd.owner != i]
+                            push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
+                            break
+                enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
+            elif (not game_over) and phase == Phase.BOSS and boss:
+                for bb in boss_bullets:
+                    for i, p in enumerate(players):
+                        if player_alive[i] and lives[i] > 0 and bb.rect.colliderect(p.rect):
+                            bb.rect.y = HEIGHT + 99
+                            lives[i] -= 1
+                            player_alive[i] = False
+                            players[i].gun_mode = GunMode.SINGLE
+                            players[i].wingmen = 0
+                            players[i].power_mul = 1.0
+                            bullets = [bbb for bbb in bullets if bbb.owner != i]
+                            drones = [ddd for ddd in drones if ddd.owner != i]
+                            push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
+                if boss.alive:
+                    for i, p in enumerate(players):
+                        if player_alive[i] and lives[i] > 0 and boss.rect.colliderect(p.rect):
+                            lives[i] -= 1
+                            player_alive[i] = False
+                            players[i].gun_mode = GunMode.SINGLE
+                            players[i].wingmen = 0
+                            players[i].power_mul = 1.0
+                            bullets = [bbb for bbb in bullets if bbb.owner != i]
+                            drones = [ddd for ddd in drones if ddd.owner != i]
+                            push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
+                            p.rect.midbottom = spawn_pos[i]
+                boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
 
-        explosions = [fx for fx in explosions if fx.alive(now)]
-
-        if (not game_over) and phase == Phase.WAVE:
-            for e in enemies:
-                if not e.alive:
-                    continue
-                for i, p in enumerate(players):
-                    if player_alive[i] and lives[i] > 0 and e.rect.colliderect(p.rect):
-                        e.alive = False
-                        push_explosion(explosions, float(e.rect.centerx), float(e.rect.centery), now)
-                        lives[i] -= 1
-                        player_alive[i] = False
-                        players[i].gun_mode = GunMode.SINGLE
-                        players[i].wingmen = 0
-                        players[i].power_mul = 1.0
-                        bullets = [bb for bb in bullets if bb.owner != i]
-                        drones = [dd for dd in drones if dd.owner != i]
-                        push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
-                        break
-            enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
-        elif (not game_over) and phase == Phase.BOSS and boss:
-            for bb in boss_bullets:
-                for i, p in enumerate(players):
-                    if player_alive[i] and lives[i] > 0 and bb.rect.colliderect(p.rect):
-                        bb.rect.y = HEIGHT + 99
-                        lives[i] -= 1
-                        player_alive[i] = False
-                        players[i].gun_mode = GunMode.SINGLE
-                        players[i].wingmen = 0
-                        players[i].power_mul = 1.0
-                        bullets = [bbb for bbb in bullets if bbb.owner != i]
-                        drones = [ddd for ddd in drones if ddd.owner != i]
-                        push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
-            if boss.alive:
-                for i, p in enumerate(players):
-                    if player_alive[i] and lives[i] > 0 and boss.rect.colliderect(p.rect):
-                        lives[i] -= 1
-                        player_alive[i] = False
-                        players[i].gun_mode = GunMode.SINGLE
-                        players[i].wingmen = 0
-                        players[i].power_mul = 1.0
-                        bullets = [bbb for bbb in bullets if bbb.owner != i]
-                        drones = [ddd for ddd in drones if ddd.owner != i]
-                        push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
-                        p.rect.midbottom = spawn_pos[i]
-            boss_bullets = [bb for bb in boss_bullets if bb.rect.top < HEIGHT + 20]
-
-        if not game_over:
-            for p in pickups:
-                p.update()
-            pickups = [
-                p
-                for p in pickups
-                if p.alive and (p.kind == PickupKind.WINGMAN or p.rect.top < HEIGHT + _vu(40))
-            ]
-            for pick in pickups:
-                if not pick.alive:
-                    continue
-                for i, pl in enumerate(players):
-                    if lives[i] <= 0:
+            if not game_over:
+                for p in pickups:
+                    p.update()
+                pickups = [
+                    p
+                    for p in pickups
+                    if p.alive and (p.kind == PickupKind.WINGMAN or p.rect.top < HEIGHT + _vu(40))
+                ]
+                for pick in pickups:
+                    if not pick.alive:
                         continue
-                    if pick.rect.colliderect(pl.rect.inflate(_vu(4), _vu(4))):
-                        apply_pickup(pl, pick.kind)
-                        pick.alive = False
-                        break
-            pickups = [p for p in pickups if p.alive]
+                    for i, pl in enumerate(players):
+                        if lives[i] <= 0:
+                            continue
+                        if pick.rect.colliderect(pl.rect.inflate(_vu(4), _vu(4))):
+                            apply_pickup(pl, pick.kind)
+                            pick.alive = False
+                            break
+                pickups = [p for p in pickups if p.alive]
 
-        if (not game_over) and phase == Phase.WAVE and wave_kills >= need_kills and not any(e.alive for e in enemies):
-            enemies.clear()
-            bullets.clear()
-            drones.clear()
-            pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
-            boss_bullets.clear()
-            boss = Boss(assets.boss_for_level(current_level), current_level - 1, max(players[0].wingmen, players[1].wingmen))
-            last_boss_shot = now
-            phase = Phase.BOSS
-        if (not game_over) and phase == Phase.BOSS and boss and not boss.alive:
-            settlement_level_score = score - score_at_level_start
-            settlement_until = now + 2000
-            phase = Phase.SETTLEMENT
-        if (not game_over) and phase == Phase.SETTLEMENT and now >= settlement_until:
-            current_level += 1
-            wave_kills = 0
-            enemies.clear()
-            bullets.clear()
-            drones.clear()
-            pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
-            boss_bullets.clear()
-            boss = None
-            score_at_level_start = score
-            phase = Phase.WAVE
+            if (not game_over) and phase == Phase.WAVE and wave_kills >= need_kills and not any(e.alive for e in enemies):
+                enemies.clear()
+                bullets.clear()
+                drones.clear()
+                pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
+                boss_bullets.clear()
+                boss = Boss(assets.boss_for_level(current_level), current_level - 1, max(players[0].wingmen, players[1].wingmen))
+                last_boss_shot = now
+                phase = Phase.BOSS
+            if (not game_over) and phase == Phase.BOSS and boss and not boss.alive:
+                settlement_level_score = score - score_at_level_start
+                settlement_until = now + 2000
+                phase = Phase.SETTLEMENT
+            if (not game_over) and phase == Phase.SETTLEMENT and now >= settlement_until:
+                current_level += 1
+                wave_kills = 0
+                enemies.clear()
+                bullets.clear()
+                drones.clear()
+                pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
+                boss_bullets.clear()
+                boss = None
+                score_at_level_start = score
+                phase = Phase.WAVE
 
-        game_over = all(v <= 0 for v in lives)
+            game_over = all(v <= 0 for v in lives)
 
         if client_addr is not None:
             state = {
@@ -1558,7 +1368,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                 "game_over": game_over,
                 "ts": time.time(),
             }
-            _safe_send_json(sock, client_addr, state)
+            udp_send_json(sock, client_addr, state)
 
         bg_t += 1.0 / FPS
         draw_background(canvas, assets, bg_t)
@@ -1630,8 +1440,8 @@ def run_lan_host(bind_ip: str, port: int) -> None:
         pygame.display.flip()
         clock.tick(FPS)
 
+    advertiser.close()
     sock.close()
-    discover_sock.close()
     pygame.quit()
     sys.exit(0)
 
@@ -1667,15 +1477,30 @@ def run_lan_client(server_ip: str, port: int) -> None:
     sock.setblocking(False)
     server_addr = (server_ip, port)
     lan_log(f"[CLIENT] start target={server_ip}:{port} pid={os.getpid()}")
-    _safe_send_json(sock, server_addr, {"type": "join"})
-    lan_log(f"[CLIENT] send join -> {server_ip}:{port}")
     last_state: dict[str, object] | None = None
     bg_t = 0.0
+    # 主机可能比客户端晚一两秒才 bind 游戏口；只发一次 join 会永远连不上，需周期性重试
+    handshake_ok = False
+    last_join_ms = -100_000
+    last_join_log_ms = -100_000
+    join_log_once = False
+    JOIN_RETRY_MS = 400
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+
+        now_ms = pygame.time.get_ticks()
+        if not handshake_ok and now_ms - last_join_ms >= JOIN_RETRY_MS:
+            udp_send_json(sock, server_addr, {"type": "join"})
+            last_join_ms = now_ms
+            if not join_log_once:
+                lan_log(f"[CLIENT] send join -> {server_ip}:{port} (未收到应答则每{JOIN_RETRY_MS}ms重发)")
+                join_log_once = True
+            elif now_ms - last_join_log_ms >= 5000:
+                lan_log(f"[CLIENT] 仍等待主机，继续发送 join -> {server_ip}:{port}")
+                last_join_log_ms = now_ms
 
         keys = pygame.key.get_pressed()
         dx = (-1 if (keys[pygame.K_LEFT] or keys[pygame.K_a]) else 0) + (
@@ -1687,16 +1512,19 @@ def run_lan_client(server_ip: str, port: int) -> None:
         fire = bool(keys[pygame.K_SPACE])
         support = bool(keys[pygame.K_m] or keys[pygame.K_LCTRL])
         respawn = bool(keys[pygame.K_r])
-        _safe_send_json(
+        udp_send_json(
             sock,
             server_addr,
             {"type": "input", "dx": dx, "dy": dy, "fire": fire, "support": support, "respawn": respawn},
         )
 
-        for msg, _ in _poll_lan_messages(sock):
+        for msg, _ in udp_recv_all_json(sock):
             if msg.get("type") == "ack":
-                lan_log(f"[CLIENT] recv ack from={server_ip}:{port}")
+                if not handshake_ok:
+                    lan_log(f"[CLIENT] recv ack from={server_ip}:{port}")
+                handshake_ok = True
             if msg.get("type") == "state":
+                handshake_ok = True
                 last_state = msg
 
         bg_t += 1.0 / FPS
@@ -1916,6 +1744,24 @@ def run_lan_client(server_ip: str, port: int) -> None:
     sock.close()
     pygame.quit()
     sys.exit(0)
+
+
+def auto_pair_and_run(port: int = LAN_PORT, timeout_s: float = 120.0) -> None:
+    """菜单/命令行进入：先走 lan_pairing 大厅，再启动主机或客户端。"""
+    run_pairing_lobby(
+        width=WIDTH,
+        height=HEIGHT,
+        vu=_vu,
+        compute_window_size=compute_window_size,
+        game_id="leidian",
+        game_port=port,
+        discovery_port=LAN_DISCOVERY_PORT,
+        timeout_s=timeout_s,
+        log=lan_log,
+        on_become_host=lambda: run_lan_host("0.0.0.0", port),
+        on_become_client=lambda ip, gp: run_lan_client(ip, gp),
+        caption="雷电 · 自动配对中",
+    )
 
 
 def level_kills_to_boss(level: int) -> int:

@@ -26,7 +26,7 @@ ENV/
 Thumbs.db
 desktop.ini
 
-# 日志与临时
+# 日志与临时（*.log 含 main.LAN_LOG_FILE = lan_debug.log）
 *.log
 *.tmp
 

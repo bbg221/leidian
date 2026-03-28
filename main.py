@@ -104,6 +104,12 @@ SPECIAL_MAX_BULLET_HITS = 5
 MIN_GUN_BULLET_DAMAGE = 2
 SPECIAL_ENEMY_HP_CAP = SPECIAL_MAX_BULLET_HITS * MIN_GUN_BULLET_DAMAGE
 DRONE_MISSILE_DAMAGE = 9
+# 第 N 关起：部分敌机偶尔向下发射小弹（低密度，与 Boss 弹区分贴图）
+ENEMY_SHOOTING_MIN_LEVEL = 15
+ENEMY_SHOOTER_SPAWN_CHANCE = 0.34
+ENEMY_SHOOT_TRY_CHANCE = 0.002
+ENEMY_SHOOT_COOLDOWN_MIN_MS = 2400
+ENEMY_SHOOT_COOLDOWN_MAX_MS = 5600
 
 # 机体贴图基准刻意压低，在大分辨率下仍显小；速度/UI 仍跟 _VIEW_S
 PLAYER_MAX_W, PLAYER_MAX_H = _vu(30), _vu(30)
@@ -781,6 +787,8 @@ class Enemy:
         "pattern",
         "base_score",
         "wobble_amp",
+        "shooter",
+        "next_shot_after_ms",
     )
 
     def __init__(
@@ -812,6 +820,11 @@ class Enemy:
             self.hp = max(1, int(round(arch.base_hp * mul)))
         self.alive = True
         self.wobble = random.random() * math.pi * 2
+        self.shooter = False
+        self.next_shot_after_ms = 0
+        if level >= ENEMY_SHOOTING_MIN_LEVEL and random.random() < ENEMY_SHOOTER_SPAWN_CHANCE:
+            self.shooter = True
+            self.next_shot_after_ms = pygame.time.get_ticks() + random.randint(0, 4200)
 
     def center(self) -> tuple[float, float]:
         return float(self.rect.centerx), float(self.rect.centery)
@@ -928,6 +941,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
 
     assets = Assets()
     boss_bullet_skin = make_boss_bullet_surf(_vu(9), _vu(19))
+    enemy_shot_skin = make_enemy_shot_bullet_surf(_vu(5), _vu(14))
     players = [Player(assets.player), Player(assets.player)]
     spawn_pos = [
         (WIDTH // 2 - _vu(80), HEIGHT - _vu(40)),
@@ -941,6 +955,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
     enemies: list[Enemy] = []
     pickups: list[Pickup] = []
     boss_bullets: list[EnemyBullet] = []
+    enemy_shot_bullets: list[EnemyBullet] = []
     explosions: list[ExplosionFx] = []
     remote_input = LanInput()
     last_fire = [0, 0]
@@ -1088,6 +1103,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                 enemies.clear()
                 pickups.clear()
                 boss_bullets.clear()
+                enemy_shot_bullets.clear()
             if (not game_over) and phase == Phase.WAVE:
                 wm_for_spawn = max(
                     players[0].wingmen if player_alive[0] else 0,
@@ -1128,6 +1144,10 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                 for e in enemies:
                     e.update()
                 enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
+                try_spawn_enemy_shots(enemies, current_level, now, enemy_shot_skin, enemy_shot_bullets)
+                for eb in enemy_shot_bullets:
+                    eb.update()
+                enemy_shot_bullets = [eb for eb in enemy_shot_bullets if eb.rect.top < HEIGHT + 20]
             if (not game_over) and phase == Phase.BOSS and boss:
                 boss.update(clock.get_time() / 1000.0)
                 if boss.alive and now - last_boss_shot >= boss_fire_interval(current_level):
@@ -1230,6 +1250,18 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                             push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
                             break
                 enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
+                for eb in enemy_shot_bullets:
+                    for i, p in enumerate(players):
+                        if player_alive[i] and lives[i] > 0 and eb.rect.colliderect(p.rect):
+                            eb.rect.y = HEIGHT + 99
+                            lives[i] -= 1
+                            player_alive[i] = False
+                            players[i].gun_mode = GunMode.SINGLE
+                            players[i].wingmen = 0
+                            players[i].power_mul = 1.0
+                            bullets = [bbb for bbb in bullets if bbb.owner != i]
+                            drones = [ddd for ddd in drones if ddd.owner != i]
+                            push_explosion(explosions, float(players[i].rect.centerx), float(players[i].rect.centery), now, big=True)
             elif (not game_over) and phase == Phase.BOSS and boss:
                 for bb in boss_bullets:
                     for i, p in enumerate(players):
@@ -1283,6 +1315,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                 drones.clear()
                 pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
                 boss_bullets.clear()
+                enemy_shot_bullets.clear()
                 boss = Boss(assets.boss_for_level(current_level), current_level - 1, max(players[0].wingmen, players[1].wingmen))
                 last_boss_shot = now
                 phase = Phase.BOSS
@@ -1298,6 +1331,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                 drones.clear()
                 pickups = [p for p in pickups if p.alive and p.kind == PickupKind.WINGMAN]
                 boss_bullets.clear()
+                enemy_shot_bullets.clear()
                 boss = None
                 score_at_level_start = score
                 phase = Phase.WAVE
@@ -1353,6 +1387,7 @@ def run_lan_host(bind_ip: str, port: int) -> None:
                     else None
                 ),
                 "boss_bullets": [{"x": bb.rect.centerx, "y": bb.rect.centery} for bb in boss_bullets],
+                "enemy_shots": [{"x": eb.rect.centerx, "y": eb.rect.centery} for eb in enemy_shot_bullets],
                 "score": score,
                 "level": current_level,
                 "phase": phase.name,
@@ -1376,6 +1411,8 @@ def run_lan_host(bind_ip: str, port: int) -> None:
             for e in enemies:
                 if e.alive:
                     draw_enemy(canvas, e)
+            for eb in enemy_shot_bullets:
+                canvas.blit(eb.surf, eb.rect)
         if phase == Phase.BOSS and boss and boss.alive:
             canvas.blit(boss.surf, boss.rect)
             draw_boss_hp(canvas, boss, font)
@@ -1460,6 +1497,7 @@ def run_lan_client(server_ip: str, port: int) -> None:
     bullet_surf_by_mode = {m.name: v[0] for m, v in assets.gun_lasers.items()}
     default_bullet_surf = assets.gun_lasers[GunMode.SINGLE][0]
     boss_bullet_surf = make_boss_bullet_surf(_vu(9), _vu(19))
+    enemy_shot_surf = make_enemy_shot_bullet_surf(_vu(5), _vu(14))
     drone_base_surf = assets.wing_missile
     pattern_enemy_surf: dict[str, pygame.Surface] = {}
     for a in assets.enemy_archetypes:
@@ -1545,6 +1583,7 @@ def run_lan_client(server_ip: str, port: int) -> None:
             settlement_left_ms = int(last_state.get("settlement_left_ms", 0))
             boss_info = last_state.get("boss", None)
             boss_bullets = last_state.get("boss_bullets", [])
+            enemy_shots = last_state.get("enemy_shots", [])
             lightning_left = int(last_state.get("lightning", 0))
             if isinstance(players, list):
                 for i, p in enumerate(players):
@@ -1629,6 +1668,14 @@ def run_lan_client(server_ip: str, port: int) -> None:
                             width=max(1, _vu(2)),
                             border_radius=max(2, _vu(4)),
                         )
+            if phase_name == Phase.WAVE.name and isinstance(enemy_shots, list):
+                for es in enemy_shots:
+                    if not isinstance(es, dict):
+                        continue
+                    x = int(es.get("x", WIDTH // 2))
+                    y = int(es.get("y", HEIGHT // 2))
+                    r = enemy_shot_surf.get_rect(center=(x, y))
+                    canvas.blit(enemy_shot_surf, r)
             if isinstance(pickups, list):
                 for p in pickups:
                     if not isinstance(p, dict):
@@ -1812,6 +1859,47 @@ def boss_bullet_speed(level: int) -> float:
     return min(12.5, 3.8 + min(level, 48) * 0.18)
 
 
+def enemy_shot_speed(level: int) -> float:
+    """普通敌机弹略慢于 Boss 弹，随关卡略增。"""
+    return max(_vf(2.5), min(_vf(6.5), boss_bullet_speed(level) * 0.5))
+
+
+def make_enemy_shot_bullet_surf(w: int, h: int) -> pygame.Surface:
+    s = pygame.Surface((w, h), pygame.SRCALPHA)
+    s.fill((180, 120, 255, 228))
+    pygame.draw.rect(s, (230, 210, 255), s.get_rect().inflate(-1, -1), border_radius=max(1, w // 4))
+    return s
+
+
+def try_spawn_enemy_shots(
+    enemies: list[Enemy],
+    level: int,
+    now_ms: int,
+    bullet_surf: pygame.Surface,
+    out_bullets: list[EnemyBullet],
+) -> None:
+    if level < ENEMY_SHOOTING_MIN_LEVEL:
+        return
+    for e in enemies:
+        if not e.alive or not e.shooter:
+            continue
+        if e.rect.top < _vu(40) or e.rect.bottom > HEIGHT - _vu(28):
+            continue
+        if now_ms < e.next_shot_after_ms:
+            continue
+        if random.random() >= ENEMY_SHOOT_TRY_CHANCE:
+            continue
+        out_bullets.append(
+            EnemyBullet(
+                float(e.rect.centerx) + random.uniform(-3.0, 3.0),
+                float(e.rect.bottom) + _vu(2),
+                bullet_surf,
+                enemy_shot_speed(level),
+            )
+        )
+        e.next_shot_after_ms = now_ms + random.randint(ENEMY_SHOOT_COOLDOWN_MIN_MS, ENEMY_SHOOT_COOLDOWN_MAX_MS)
+
+
 def draw_background(surf: pygame.Surface, assets: Assets, t: float) -> None:
     th = assets.bg_tile.get_height()
     yoff = int((t * 80) % th)
@@ -1939,6 +2027,7 @@ def reset_level_state(
     list[DroneMissile],
     list[Enemy],
     list[EnemyBullet],
+    list[EnemyBullet],
     list[Pickup],
     Boss | None,
     int,
@@ -1951,6 +2040,7 @@ def reset_level_state(
     drones: list[DroneMissile] = []
     enemies: list[Enemy] = []
     boss_bullets: list[EnemyBullet] = []
+    enemy_shot_bullets: list[EnemyBullet] = []
     pickups: list[Pickup] = []
     explosions: list[ExplosionFx] = []
     boss: Boss | None = None
@@ -1964,6 +2054,7 @@ def reset_level_state(
         drones,
         enemies,
         boss_bullets,
+        enemy_shot_bullets,
         pickups,
         boss,
         wave_kills,
@@ -2078,6 +2169,7 @@ def main() -> None:
 
     assets = Assets()
     boss_bullet_skin = make_boss_bullet_surf(_vu(9), _vu(19))
+    enemy_shot_skin = make_enemy_shot_bullet_surf(_vu(5), _vu(14))
 
     current_level = 1
     score = 0
@@ -2092,8 +2184,11 @@ def main() -> None:
     drones: list[DroneMissile] = []
     enemies: list[Enemy] = []
     boss_bullets: list[EnemyBullet] = []
+    enemy_shot_bullets: list[EnemyBullet] = []
     pickups: list[Pickup] = []
     boss: Boss | None = None
+    player_alive = True
+    explosions: list[ExplosionFx] = []
 
     last_boss_shot = 0
     wing_fan_phase = 0.0
@@ -2201,6 +2296,7 @@ def main() -> None:
                             drones,
                             enemies,
                             boss_bullets,
+                            enemy_shot_bullets,
                             pickups,
                             boss,
                             wave_kills,
@@ -2307,6 +2403,10 @@ def main() -> None:
             for e in enemies:
                 e.update()
             enemies = [e for e in enemies if e.alive and e.rect.top < HEIGHT + 80]
+            try_spawn_enemy_shots(enemies, current_level, now, enemy_shot_skin, enemy_shot_bullets)
+            for eb in enemy_shot_bullets:
+                eb.update()
+            enemy_shot_bullets = [eb for eb in enemy_shot_bullets if eb.rect.top < HEIGHT + 20]
 
             for p in pickups:
                 if p.alive and p.rect.colliderect(player.rect.inflate(_vu(4), _vu(4))):
@@ -2329,6 +2429,22 @@ def main() -> None:
                     player.power_mul = 1.0
                     bullets.clear()
                     drones.clear()
+                    enemy_shot_bullets.clear()
+                    if lives <= 0:
+                        phase = Phase.GAME_OVER
+
+            for eb in enemy_shot_bullets:
+                if player_alive and eb.rect.colliderect(player.rect):
+                    eb.rect.y = HEIGHT + 99
+                    push_explosion(explosions, float(player.rect.centerx), float(player.rect.centery), now, big=True)
+                    player_alive = False
+                    lives -= 1
+                    player.gun_mode = GunMode.SINGLE
+                    player.wingmen = 0
+                    player.power_mul = 1.0
+                    bullets.clear()
+                    drones.clear()
+                    enemy_shot_bullets.clear()
                     if lives <= 0:
                         phase = Phase.GAME_OVER
 
@@ -2341,6 +2457,7 @@ def main() -> None:
                 bullets.clear()
                 drones.clear()
                 boss_bullets.clear()
+                enemy_shot_bullets.clear()
                 boss = Boss(
                     assets.boss_for_level(current_level),
                     current_level - 1,
@@ -2548,6 +2665,7 @@ def main() -> None:
                     drones,
                     enemies,
                     boss_bullets,
+                    enemy_shot_bullets,
                     pickups,
                     boss,
                     _,
@@ -2579,6 +2697,8 @@ def main() -> None:
                 draw_boss_hp(canvas, boss, font)
             for b in bullets:
                 canvas.blit(b.surf, b.rect)
+            for eb in enemy_shot_bullets:
+                canvas.blit(eb.surf, eb.rect)
             for bb in boss_bullets:
                 canvas.blit(bb.surf, bb.rect)
             for d in drones:

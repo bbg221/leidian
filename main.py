@@ -2825,13 +2825,73 @@ def main() -> None:
     sys.exit(0)
 
 
+def run_main_menu(port: int = LAN_PORT) -> None:
+    """启动后先选模式：局域网配对或单机；无需命令行参数。"""
+    pygame.init()
+    win_w, win_h = compute_window_size(WIDTH, HEIGHT)
+    screen = pygame.display.set_mode((win_w, win_h))
+    canvas = pygame.Surface((WIDTH, HEIGHT))
+    pygame.display.set_caption("雷电 · Leidian")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("microsoftyahei", max(16, _vu(24)))
+    font_small = pygame.font.SysFont("microsoftyahei", max(12, _vu(18)))
+    options: list[tuple[str, str]] = [
+        ("局域网双人（自动发现配对）", "lan"),
+        ("单机游戏", "solo"),
+    ]
+    sel = 0
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_UP, pygame.K_w):
+                    sel = (sel - 1) % len(options)
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    sel = (sel + 1) % len(options)
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    choice = options[sel][1]
+                    pygame.quit()
+                    if choice == "lan":
+                        auto_pair_and_run(port)
+                    else:
+                        main()
+                    return
+                elif event.key == pygame.K_ESCAPE:
+                    running = False
+        canvas.fill((14, 18, 36))
+        title = font.render("雷电 Leidian", True, (220, 235, 255))
+        canvas.blit(title, title.get_rect(center=(WIDTH // 2, _vu(96))))
+        sub = font_small.render("选择游戏模式", True, (170, 190, 220))
+        canvas.blit(sub, sub.get_rect(center=(WIDTH // 2, _vu(142))))
+        tip = font_small.render("↑↓ 选择   回车 确认   ESC 退出", True, (150, 165, 195))
+        canvas.blit(tip, tip.get_rect(center=(WIDTH // 2, _vu(178))))
+        y0 = _vu(230)
+        row_h = _vu(50)
+        for i, (label, _) in enumerate(options):
+            y = y0 + i * row_h
+            rect = pygame.Rect(_vu(56), y, WIDTH - _vu(112), _vu(42))
+            if i == sel:
+                pygame.draw.rect(canvas, (48, 78, 128), rect, border_radius=10)
+                pygame.draw.rect(canvas, (120, 180, 255), rect, width=max(1, _vu(2)), border_radius=10)
+            color = (255, 248, 210) if i == sel else (200, 210, 230)
+            t = font.render(label, True, color)
+            canvas.blit(t, t.get_rect(center=rect.center))
+        pygame.transform.smoothscale(canvas, (win_w, win_h), screen)
+        pygame.display.flip()
+        clock.tick(30)
+    pygame.quit()
+    sys.exit(0)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="雷电单机/局域网双人模式")
     parser.add_argument(
         "--lan",
-        choices=("off", "host", "client", "auto"),
-        default="off",
-        help="联机模式：off(单机) / host(主机) / client(客户端) / auto(自动发现配对)",
+        choices=("menu", "off", "host", "client", "auto"),
+        default="menu",
+        help="menu=启动菜单(默认) / off=直接单机 / host|client|auto=跳过菜单进联机",
     )
     parser.add_argument("--host-ip", default="127.0.0.1", help="客户端连接的主机IP")
     parser.add_argument("--bind-ip", default="0.0.0.0", help="主机绑定IP")
@@ -2847,5 +2907,7 @@ if __name__ == "__main__":
         run_lan_client(args.host_ip, args.port)
     elif args.lan == "auto":
         auto_pair_and_run(args.port)
-    else:
+    elif args.lan == "off":
         main()
+    else:
+        run_main_menu(args.port)
